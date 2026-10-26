@@ -11,34 +11,54 @@ const ENV_CERT_DIR: &str = "SSL_CERT_DIR";
 /// Load certificates from the paths specified in the environment variables
 /// `SSL_CERT_FILE` and `SSL_CERT_DIR`.
 ///
-/// If neither variable is set, returns an empty [`CertificateResult`].
-pub fn load_certs_from_env() -> CertificateResult {
-    let cert_file = env::var_os(ENV_CERT_FILE).map(PathBuf::from);
-    // Read `SSL_CERT_DIR`, split it on the platform delimiter (`:` on Unix, `;` on Windows),
-    // and return the entries as `PathBuf`s.
-    //
-    // See <https://docs.openssl.org/3.5/man1/openssl-rehash/#options>
-    let cert_dirs = match env::var_os(ENV_CERT_DIR) {
-        Some(dirs) => env::split_paths(&dirs).collect(),
+/// Returns `None` when both variables are unset or empty. Otherwise returns
+/// `Some`, even when the configured paths are missing, inaccessible, or contain
+/// no certificates. This lets callers distinguish default trust from an
+/// explicitly configured, possibly empty custom trust store.
+///
+/// `SSL_CERT_DIR` may contain multiple paths, separated by `:` on Unix or `;`
+/// on Windows. Empty entries are ignored. A non-empty value containing only
+/// separators still selects an empty custom trust store.
+///
+/// Certificates from all configured paths are combined and deduplicated. Loading
+/// errors are collected without discarding certificates from other entries.
+/// No system or bundled certificates are loaded.
+pub fn load_certs_from_env() -> Option<CertificateResult> {
+    let cert_file = env::var_os(ENV_CERT_FILE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let cert_dirs = env::var_os(ENV_CERT_DIR).filter(|value| !value.is_empty());
+    if cert_file.is_none() && cert_dirs.is_none() {
+        return None;
+    }
+    let cert_dirs = match cert_dirs {
+        Some(dirs) => env::split_paths(&dirs)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect::<Vec<_>>(),
         None => Vec::new(),
     };
 
-    load_certs_from_paths_internal(cert_file.as_deref(), &cert_dirs)
+    Some(load_certs_from_paths_internal(
+        cert_file.as_deref(),
+        &cert_dirs,
+    ))
 }
 
 /// Load certificates from the given paths.
 ///
 /// If both are `None`, returns an empty [`CertificateResult`].
 ///
-/// If `file` is `Some`, it is always used, so it must be a path to an existing,
-/// accessible file from which certificates can be loaded successfully. While parsing,
-/// the rustls-pki-types PEM parser will ignore parts of the file which are
-/// not considered part of a certificate. Certificates which are not in the right
-/// format (PEM) or are otherwise corrupted may get ignored silently.
+/// Files must contain PEM-encoded certificates. Text outside certificate blocks
+/// is ignored. PEM decoding errors are reported in [`CertificateResult::errors`]
+/// without discarding other certificates. The decoded DER is returned as-is;
+/// validating the certificates is the caller's responsibility.
 ///
-/// If `dir` is defined, a directory must exist at this path, and all files
-/// contained in it must be loaded successfully, subject to the rules outlined above for `file`.
-/// The directory is not scanned recursively and may be empty.
+/// The directory is scanned non-recursively, including regular files regardless
+/// of their names or extensions. Symlinks are followed; dangling symlinks are
+/// ignored. File and directory certificates are combined and deduplicated.
+///
+/// I/O and parsing errors include the affected path and do not discard other
+/// certificates. An empty result is allowed and is not itself an error.
 pub fn load_certs_from_paths(file: Option<&Path>, dir: Option<&Path>) -> CertificateResult {
     let dirs = match dir {
         Some(d) => vec![d],
@@ -128,11 +148,12 @@ fn load_pem_certs(path: &Path, out: &mut CertificateResult) {
     }
 }
 
-/// Results from trying to load certificates from the platform's native store.
+/// Certificates and errors collected from the configured files and directories.
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct CertificateResult {
-    /// Any certificates that were successfully loaded.
+    /// Deduplicated certificate bytes decoded from PEM, without DER validation.
+    /// This may be empty even when loading encountered no errors.
     pub certs: Vec<CertificateDer<'static>>,
     /// Any errors encountered while loading certificates.
     pub errors: Vec<Error>,
@@ -163,11 +184,9 @@ impl CertificateResult {
     fn pem_error(&mut self, err: pem::Error, path: &Path) {
         self.errors.push(Error {
             context: "failed to read PEM from file",
+            path: path.to_owned(),
             kind: match err {
-                pem::Error::Io(err) => ErrorKind::Io {
-                    inner: err,
-                    path: path.to_owned(),
-                },
+                pem::Error::Io(err) => ErrorKind::Io(err),
                 _ => ErrorKind::Pem(err),
             },
         });
@@ -176,10 +195,8 @@ impl CertificateResult {
     fn io_error(&mut self, err: io::Error, path: &Path, context: &'static str) {
         self.errors.push(Error {
             context,
-            kind: ErrorKind::Io {
-                inner: err,
-                path: path.to_owned(),
-            },
+            path: path.to_owned(),
+            kind: ErrorKind::Io(err),
         });
     }
 }
@@ -187,22 +204,22 @@ impl CertificateResult {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ErrorKind {
-    Io { inner: io::Error, path: PathBuf },
-    Os(Box<dyn StdError + Send + Sync + 'static>),
+    Io(io::Error),
     Pem(pem::Error),
 }
 
 #[derive(Debug)]
 pub struct Error {
     pub context: &'static str,
+    /// The file or directory that caused this error.
+    pub path: PathBuf,
     pub kind: ErrorKind,
 }
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         Some(match &self.kind {
-            ErrorKind::Io { inner, .. } => inner,
-            ErrorKind::Os(err) => &**err,
+            ErrorKind::Io(err) => err,
             ErrorKind::Pem(err) => err,
         })
     }
@@ -210,15 +227,12 @@ impl StdError for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.context)?;
-        f.write_str(": ")?;
+        write!(f, "{}: ", self.context)?;
         match &self.kind {
-            ErrorKind::Io { inner, path } => {
-                write!(f, "{inner} at '{}'", path.display())
-            }
-            ErrorKind::Os(err) => err.fmt(f),
+            ErrorKind::Io(err) => err.fmt(f),
             ErrorKind::Pem(err) => err.fmt(f),
-        }
+        }?;
+        write!(f, " at '{}'", self.path.display())
     }
 }
 
@@ -243,20 +257,20 @@ mod tests {
 
         {
             let mut file = File::create(&file_path).unwrap();
-            write!(file, "{}", &cert1).unwrap();
-            write!(file, "{}", &cert2).unwrap();
+            write!(file, "{cert1}").unwrap();
+            write!(file, "{cert2}").unwrap();
         }
 
         {
             // Duplicate (already in `file_path`)
             let mut file = File::create(dir_path.join("71f3bb26.0")).unwrap();
-            write!(file, "{}", &cert1).unwrap();
+            write!(file, "{cert1}").unwrap();
         }
 
         {
             // Duplicate (already in `file_path`)
             let mut file = File::create(dir_path.join("912e7cd5.0")).unwrap();
-            write!(file, "{}", &cert2).unwrap();
+            write!(file, "{cert2}").unwrap();
         }
 
         let result = load_certs_from_paths(Some(&file_path), None);
@@ -284,7 +298,7 @@ mod tests {
         let mut result = CertificateResult::default();
         load_pem_certs(Path::new("no/such/file"), &mut result);
         match &first_error(&result).kind {
-            ErrorKind::Io { inner, .. } => assert_eq!(inner.kind(), io::ErrorKind::NotFound),
+            ErrorKind::Io(inner) => assert_eq!(inner.kind(), io::ErrorKind::NotFound),
             _ => panic!("unexpected error {:?}", result.errors),
         }
     }
@@ -294,7 +308,7 @@ mod tests {
         let mut result = CertificateResult::default();
         load_pem_certs_from_dir(Path::new("no/such/directory"), &mut result);
         match &first_error(&result).kind {
-            ErrorKind::Io { inner, .. } => assert_eq!(inner.kind(), io::ErrorKind::NotFound),
+            ErrorKind::Io(inner) => assert_eq!(inner.kind(), io::ErrorKind::NotFound),
             _ => panic!("unexpected error {:?}", result.errors),
         }
     }
@@ -342,7 +356,7 @@ mod tests {
 
         let error = first_error(&result);
         match &error.kind {
-            ErrorKind::Io { inner, .. } => {
+            ErrorKind::Io(inner) => {
                 assert_eq!(inner.kind(), io::ErrorKind::PermissionDenied);
                 inner
             }
