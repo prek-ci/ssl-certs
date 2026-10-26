@@ -1,13 +1,13 @@
 [package]
 name = "ssl-certs"
-version = "0.1.1"
+version = "0.2.0"
 description = "Load SSL certs from env vars"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/j178/ssl-certs"
-homepage = "https://github.com/j178/ssl-certs"
+repository = "https://github.com/prek-ci/ssl-certs"
+homepage = "https://github.com/prek-ci/ssl-certs"
 
 [dependencies]
 pki-types = { package = "rustls-pki-types", version = "1.10", features = ["std"] }
